@@ -1,0 +1,22 @@
+{
+    "name": "supera-phppackages/simplegallery",
+    "description": "A simple gallery package",
+    "keywords": ["laravel", "gallery", "images"],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Irineu Martins Junior",
+            "email": "irineu@mixd.com.br",
+            "homepage": "http://www.mixd.com.br/",
+            "role": "Developer"
+        }
+    ],
+    "require": {
+        "laravel/framework": "6.*"    
+    },
+    "autoload": {
+        "psr-4": {
+            "Mixdinternet\\Galleries\\": "src/"
+        }
+    }
+}
