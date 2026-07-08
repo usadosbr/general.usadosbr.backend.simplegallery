@@ -3,8 +3,8 @@
 namespace Mixdinternet\Galleries;
 
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 use App\Jobs\InsertImagesVehicle;
-use Carbon\Carbon;
 use Throwable;
 use Mixdinternet\Cars\Car;
 use Mixdinternet\Motorcycles\Motorcycle;
@@ -16,173 +16,159 @@ trait GalleriableTrait
     public static function bootGalleriableTrait()
     {
         self::saved(function ($model) {
-            if (!request()->has('gallery')) {
+            // Both "gallery" and "images" must be present in the request, otherwise there is nothing to do.
+            if (!request()->has('gallery') || !request()->has('images')) {
                 return;
-            }
-
-            if (!request()->has('images')) {
-                return;
-            }
-
-            if (request()->get('gallery')[0] == 'images') {
-                $idmd5 = substr(md5($model->id), 2, 8);
-                $imageName = $model->slug . '-' . $idmd5;
-            } else {
-                if (!isset($model->version->model->brand->slug) && $model->external_id) {
-                    $brand = $model->slug;
-                    $modelo = $model->advertiser_id;
-                    $version = $model->external_id;
-                } else {
-                    $brand = $model->version->model->brand->slug;
-                    $modelo = $model->version->model->slug;
-                    $version = $model->version->slug;
-                }
-                $year = $model->year_mod;
-                $city = $model->advertiser->city->slug;
-                $idmd5 = substr(md5($model->id), 2, 8);
-
-                $imageName = $brand . '-' . $modelo . '-' . $version . '-' . $year . '-' . $city . '-' . $idmd5;
-                $imageName = str_replace(' ', '-', $imageName);
-                $imageName = str_replace('.', '-', $imageName);
             }
 
             $reqGallery = request()->get('gallery');
             $reqImages = request()->get('images');
 
+            $imageName = strtolower(self::buildGalleryImageName($model, $reqGallery));
+            $modelClass = get_class($model);
+            $queue = self::isIntegradorVehicle($model) ? 'imgs_integrador' : 'vehicles';
+
             foreach ($reqGallery as $galleryName) {
+                if (!isset($reqImages[$galleryName])) {
+                    continue;
+                }
 
-                if (isset($reqImages[$galleryName])) {
-                    $gallery = $model->galleries($galleryName)->first();
-                    if ($gallery == null) {
-                        $gallery = $model->galleries($galleryName)->create(['name' => $galleryName]);
-                    }
+                $gallery = $model->galleries($galleryName)->first()
+                    ?? $model->galleries($galleryName)->create(['name' => $galleryName]);
 
-                    $last = $gallery->images()->get()->last();
-                    $count = 0;
-                    if ($last) {
-                        $count = ($last->order + 1);
-                    }
+                // Continue numbering after the current highest order without loading every image.
+                $maxOrder = $gallery->images()->max('order');
+                $count = is_null($maxOrder) ? 0 : ((int) $maxOrder + 1);
 
-                    foreach ($reqImages[$galleryName] as $k => $v) {
-                        try {
+                foreach ($reqImages[$galleryName] as $k => $v) {
+                    try {
+                        $order = self::parseExplicitOrder($v);
+                        $suffix = is_null($order) ? '' : '--' . $order;
+                        $imagepath = $imageName . '-' . Str::random(2) . $suffix . '.webp';
 
-                            $toOrder = false;
-                            if (strpos($v, "--") !== false) {
-                                $arrExplode1 = explode('--', $v);
-                                if ($arrExplode1 != []) {
-                                    $arrExplode2 = explode('.', $arrExplode1[1]);
-                                    $order = (int) $arrExplode2[0];
-                                    $toOrder = true;
-                                }
-                            }
+                        $subDir = implode('/', str_split(substr(md5($imagepath), 0, 6), 2));
+                        $targetPath = '/media/gallery/' . $subDir . '/' . $imagepath;
 
-                            $imageGCS = Storage::disk('gcs')->get($v);
+                        $webp = self::toWebp(Storage::disk('gcs')->get($v));
 
-                            $imagick = new \Imagick();
-
-                            $imagick->readimageblob($imageGCS);
-                            $imagick->stripImage();
-                            $w = $imagick->getImageWidth();
-                            $h = $imagick->getImageHeight();
-
-                            $imageGCS = $imagick->getimageblob();
-
-                            $friendlyName = explode('/', $v)[7];
-                            $extension = pathinfo($friendlyName, PATHINFO_EXTENSION);
-
-                            if ($toOrder) {
-                                $imagepath = strtolower($imageName) . '-' . str_random(2) . '--' . $order . '.' . 'webp';
-                            } else {
-                                $imagepath = strtolower($imageName) . '-' . str_random(2) . '.' . 'webp';
-                            }
-
-
-
-                            //$imagepath = strtolower($imageName) . '-' . str_random(2) . '.' . $extension;
-
-                            $subDir = implode('/', str_split(substr(md5($imagepath), 0, 6), 2));
-
-                            $targetPath = '/media/gallery/' . $subDir . '/' . $imagepath;
-
-
-                            $data = imagecreatefromstring($imageGCS);
-
-                            ob_start();
-
-                            imagejpeg($data);
-
-                            $cont = ob_get_contents();
-
-                            ob_end_clean();
-
-                            $content = imagecreatefromstring($cont);
-
-                            imagewebp($content, storage_path($imagepath));
-
-
-                            $data = file_get_contents(storage_path($imagepath));
-
-                            $image = new Image();
-                            $uploaded = Storage::disk('gcs')->put($targetPath, $data);
-
-
-                            unlink(storage_path($imagepath));
-
-                            Storage::disk('gcs')->delete($v);
-                            $image->name = $targetPath;
-                            if ($uploaded) {
-
-                                $modelType = get_class($model);
-                                switch ($modelType) {
-                                    case 'Mixdinternet\Cars\Car':
-                                        $vehicleIntegrador = Car::where('id', $model->id)
-                                            ->whereNotNull('code')->first();
-                                        break;
-                                    case 'Mixdinternet\Motorcycles\Motorcycle':
-                                        $vehicleIntegrador = Motorcycle::where('id', $model->id)
-                                            ->whereNotNull('code')->first();
-                                        break;
-                                    case 'Mixdinternet\Trucks\Truck':
-                                        $vehicleIntegrador = Truck::where('id', $model->id)->first();
-                                        break;
-                                    case 'Mixdinternet\Sailings\Sailing':
-                                        $vehicleIntegrador = Sailing::where('id', $model->id)->first();
-                                        break;
-                                    default:
-                                        $vehicleIntegrador = false;
-                                        break;
-                                } //switch
-
-                                if ($vehicleIntegrador) {
-                                    dispatch(new InsertImagesVehicle($targetPath, $imagepath, $subDir, $model->id, get_class($model)))->onQueue('imgs_integrador');
-                                } else {
-                                    dispatch(new InsertImagesVehicle($targetPath, $imagepath, $subDir, $model->id, get_class($model)))->onQueue('vehicles');
-                                }
-
-                                $alreadySaved = Image::where('name', $image->name)->where('gallery_id', $gallery->id)->count();
-
-                                if ($alreadySaved >= 1) {
-                                    break;
-                                }
-
-                                $image->description = '';
-                                $image->order = ($k + $count);
-                                $count++;
-                                $image->gallery()->associate($gallery);
-                                $image->save();
-                            }
-                        } catch (Throwable $e) {
-                            devlogs("Diretório da imagem falhada: {$v}");
-                            devlogs($e->getMessage(), '');
-                            devlogs('Falha na inserção de imagem do anunciante: ' . $model->advertiser->id, '');
-                            devlogs('Falha na inserção de imagem do veículo: ' . $model->id, '');
+                        if (!Storage::disk('gcs')->put($targetPath, $webp)) {
+                            continue;
                         }
+
+                        // Only remove the source once the converted image is safely stored.
+                        Storage::disk('gcs')->delete($v);
+
+                        dispatch(new InsertImagesVehicle($targetPath, $imagepath, $subDir, $model->id, $modelClass))
+                            ->onQueue($queue);
+
+                        // Skip persisting a duplicate record for the same gallery.
+                        $alreadySaved = Image::where('name', $targetPath)
+                            ->where('gallery_id', $gallery->id)
+                            ->exists();
+
+                        if ($alreadySaved) {
+                            continue;
+                        }
+
+                        $image = new Image();
+                        $image->name = $targetPath;
+                        $image->description = '';
+                        $image->order = $k + $count;
+                        $image->gallery()->associate($gallery);
+                        $image->save();
+
+                        $count++;
+                    } catch (Throwable $e) {
+                        devlogs("Diretório da imagem falhada: {$v}");
+                        devlogs($e->getMessage(), '');
+                        devlogs('Falha na inserção de imagem do anunciante: ' . $model->advertiser->id, '');
+                        devlogs('Falha na inserção de imagem do veículo: ' . $model->id, '');
                     }
                 }
             }
 
             request()->replace(array_merge(request()->all(), ['gallery' => [''], 'images' => []]));
         });
+    }
+
+    /**
+     * Build the base file name (without extension) used for every image of this model.
+     */
+    private static function buildGalleryImageName($model, array $reqGallery): string
+    {
+        $idHash = substr(md5($model->id), 2, 8);
+
+        if (($reqGallery[0] ?? null) === 'images') {
+            return $model->slug . '-' . $idHash;
+        }
+
+        if (!isset($model->version->model->brand->slug) && $model->external_id) {
+            $brand = $model->slug;
+            $modelo = $model->advertiser_id;
+            $version = $model->external_id;
+        } else {
+            $brand = $model->version->model->brand->slug;
+            $modelo = $model->version->model->slug;
+            $version = $model->version->slug;
+        }
+
+        $name = implode('-', [
+            $brand,
+            $modelo,
+            $version,
+            $model->year_mod,
+            $model->advertiser->city->slug,
+            $idHash,
+        ]);
+
+        return str_replace([' ', '.'], '-', $name);
+    }
+
+    /**
+     * A "--<n>" segment in the source path encodes an explicit order for the image.
+     */
+    private static function parseExplicitOrder(string $path): ?int
+    {
+        if (strpos($path, '--') === false) {
+            return null;
+        }
+
+        $parts = explode('--', $path);
+
+        return isset($parts[1]) ? (int) explode('.', $parts[1])[0] : null;
+    }
+
+    /**
+     * Whether the vehicle comes from the integrador feed, which uses a dedicated queue.
+     */
+    private static function isIntegradorVehicle($model): bool
+    {
+        switch (get_class($model)) {
+            case Car::class:
+            case Motorcycle::class:
+                return !is_null($model->code);
+            case Truck::class:
+            case Sailing::class:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Convert a raw image blob to a stripped WebP blob (in memory, no temp files).
+     */
+    private static function toWebp(string $blob): string
+    {
+        $imagick = new \Imagick();
+        $imagick->readImageBlob($blob);
+        $imagick->stripImage();
+        $imagick->setImageFormat('webp');
+        $webp = $imagick->getImageBlob();
+        $imagick->clear();
+        $imagick->destroy();
+
+        return $webp;
     }
 
     public function galleries($name = 'images')

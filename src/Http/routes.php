@@ -8,7 +8,6 @@ Route::group(['prefix' => 'admin'], function () {
         Route::post('galleries/destroy', ['uses' => 'GalleriesAdminController@destroy', 'as' => 'admin.galleries.destroy']);
         Route::post('galleries/update', ['uses' => 'GalleriesAdminController@update', 'as' => 'admin.galleries.update']);
     });
-
 });
 
 Route::group(['prefix' => 'api'], function () {
