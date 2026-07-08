@@ -15,10 +15,12 @@ class GalleriesServiceProvider extends ServiceProvider
     public function boot()
     {
         if (!$this->app->routesAreCached()) {
-            $this->app->router->group(['namespace' => 'Mixdinternet\Galleries\Http\Controllers'],
+            $this->app->router->group(
+                ['namespace' => 'Mixdinternet\Galleries\Http\Controllers'],
                 function () {
                     require __DIR__ . '/../Http/routes.php';
-                });
+                }
+            );
         }
 
         $this->loadViewsFrom(__DIR__ . '/../resources/views', 'mixdinternet/galleries');
@@ -45,8 +47,5 @@ class GalleriesServiceProvider extends ServiceProvider
      *
      * @return void
      */
-    public function register()
-    {
-
-    }
+    public function register() {}
 }
