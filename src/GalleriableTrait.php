@@ -171,6 +171,12 @@ trait GalleriableTrait
         return $webp;
     }
 
+    /**
+     * Resolved galleries keyed by name, memoized per model instance so repeated
+     * accessor/helper calls don't re-run the same "where name = ?" query.
+     */
+    protected $resolvedGalleries = [];
+
     public function galleries($name = 'images')
     {
         return $this->morphMany(\Mixdinternet\Galleries\Gallery::class, 'galleriable')->where('name', $name);
@@ -178,7 +184,11 @@ trait GalleriableTrait
 
     public function gallery($name = 'images')
     {
-        return $this->galleries($name)->first();
+        if (!array_key_exists($name, $this->resolvedGalleries)) {
+            $this->resolvedGalleries[$name] = $this->galleries($name)->first();
+        }
+
+        return $this->resolvedGalleries[$name];
     }
 
     public function getGalleryAttribute()
@@ -188,7 +198,7 @@ trait GalleriableTrait
 
     public function flatGallery($name = 'images')
     {
-        $gallery = $this->galleries($name)->first();
+        $gallery = $this->gallery($name);
         if (!$gallery) {
             return [];
         }
