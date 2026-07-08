@@ -1,5 +1,5 @@
 {
-    "name": "supera-phppackages/simplegallery",
+    "name": "mixdinternet/laravel-galleries",
     "description": "A simple gallery package",
     "keywords": ["laravel", "gallery", "images"],
     "license": "MIT",
