@@ -58,6 +58,7 @@ trait GalleriableTrait
                         // Only remove the source once the converted image is safely stored.
                         Storage::disk('gcs')->delete($v);
 
+                        sleep(1); // Give the queue a moment to pick up the job before we return.
                         dispatch(new InsertImagesVehicle($targetPath, $imagepath, $subDir, $model->id, $modelClass))
                             ->onQueue($queue);
 
