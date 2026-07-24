@@ -62,13 +62,13 @@ trait GalleriableTrait
                             ->onQueue($queue);
 
                         // Skip persisting a duplicate record for the same gallery.
-                        $alreadySaved = Image::where('name', $targetPath)
-                            ->where('gallery_id', $gallery->id)
-                            ->exists();
+                        // $alreadySaved = Image::where('name', $targetPath)
+                        //     ->where('gallery_id', $gallery->id)
+                        //     ->exists();
 
-                        if ($alreadySaved) {
-                            continue;
-                        }
+                        // if ($alreadySaved) {
+                        //     continue;
+                        // }
 
                         $image = new Image();
                         $image->name = $targetPath;
