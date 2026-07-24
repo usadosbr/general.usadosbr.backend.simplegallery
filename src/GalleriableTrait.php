@@ -58,17 +58,18 @@ trait GalleriableTrait
                         // Only remove the source once the converted image is safely stored.
                         Storage::disk('gcs')->delete($v);
 
+                        sleep(1); // Give the queue a moment to pick up the job before we return.
                         dispatch(new InsertImagesVehicle($targetPath, $imagepath, $subDir, $model->id, $modelClass))
                             ->onQueue($queue);
 
                         // Skip persisting a duplicate record for the same gallery.
-                        $alreadySaved = Image::where('name', $targetPath)
-                            ->where('gallery_id', $gallery->id)
-                            ->exists();
+                        // $alreadySaved = Image::where('name', $targetPath)
+                        //     ->where('gallery_id', $gallery->id)
+                        //     ->exists();
 
-                        if ($alreadySaved) {
-                            continue;
-                        }
+                        // if ($alreadySaved) {
+                        //     continue;
+                        // }
 
                         $image = new Image();
                         $image->name = $targetPath;
