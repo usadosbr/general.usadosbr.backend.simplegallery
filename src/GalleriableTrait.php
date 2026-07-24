@@ -28,6 +28,11 @@ trait GalleriableTrait
             $modelClass = get_class($model);
             $queue = self::isIntegradorVehicle($model) ? 'imgs_integrador' : 'vehicles';
 
+            // Collect every processed image across all galleries so a single job
+            // handles the whole batch instead of one job (and one vehicle-exists
+            // query) per photo.
+            $pendingImages = [];
+
             foreach ($reqGallery as $galleryName) {
                 if (!isset($reqImages[$galleryName])) {
                     continue;
@@ -58,9 +63,11 @@ trait GalleriableTrait
                         // Only remove the source once the converted image is safely stored.
                         Storage::disk('gcs')->delete($v);
 
-                        sleep(1); // Give the queue a moment to pick up the job before we return.
-                        dispatch(new InsertImagesVehicle($targetPath, $imagepath, $subDir, $model->id, $modelClass))
-                            ->onQueue($queue);
+                        $pendingImages[] = [
+                            'targetPath' => $targetPath,
+                            'imagePath' => $imagepath,
+                            'subDir' => $subDir,
+                        ];
 
                         // Skip persisting a duplicate record for the same gallery.
                         // $alreadySaved = Image::where('name', $targetPath)
@@ -86,6 +93,13 @@ trait GalleriableTrait
                         devlogs('Falha na inserção de imagem do veículo: ' . $model->id, '');
                     }
                 }
+            }
+
+            // One job per save, regardless of photo count: the job checks the
+            // vehicle exists once and processes every crop internally.
+            if (!empty($pendingImages)) {
+                dispatch(new InsertImagesVehicle($pendingImages, $model->id, $modelClass))
+                    ->onQueue($queue);
             }
 
             request()->replace(array_merge(request()->all(), ['gallery' => [''], 'images' => []]));
