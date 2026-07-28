@@ -192,6 +192,12 @@ trait GalleriableTrait
      */
     protected $resolvedGalleries = [];
 
+    /**
+     * Flattened gallery images keyed by gallery name, memoized per model instance
+     * so repeated calls don't re-run the same images query.
+     */
+    protected $resolvedFlatGalleries = [];
+
     public function galleries($name = 'images')
     {
         return $this->morphMany(\Mixdinternet\Galleries\Gallery::class, 'galleriable')->where('name', $name);
@@ -211,13 +217,24 @@ trait GalleriableTrait
         return $this->gallery();
     }
 
+    /**
+     * Return a flat array of images for the given gallery name, or an empty array if the gallery doesn't exist. This is useful for APIs that need to return a simple list of images without nested relationships.
+     * 
+     * @param string $name The name of the gallery to retrieve images from.
+     * @return array An array of images with 'id', 'name', 'description', and 'order' fields, or an empty array if the gallery doesn't exist.
+     */
     public function flatGallery($name = 'images')
     {
-        $gallery = $this->gallery($name);
-        if (!$gallery) {
-            return [];
+        if (array_key_exists($name, $this->resolvedFlatGalleries)) {
+            return $this->resolvedFlatGalleries[$name];
         }
 
-        return $gallery->images()->select('id', 'name', 'description', 'order')->get();
+        $gallery = $this->gallery($name);
+
+        if (!$gallery) {
+            return $this->resolvedFlatGalleries[$name] = [];
+        }
+
+        return $this->resolvedFlatGalleries[$name] = $gallery->images()->select('id', 'name', 'description', 'order')->get();
     }
 }
