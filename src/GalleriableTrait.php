@@ -38,8 +38,14 @@ trait GalleriableTrait
                     continue;
                 }
 
-                $gallery = $model->galleries($galleryName)->first()
-                    ?? $model->galleries($galleryName)->create(['name' => $galleryName]);
+                // Reuse the memoized accessor so a later gallery()/flatGallery() call in the
+                // same request doesn't re-query for the gallery we just fetched or created.
+                $gallery = $model->gallery($galleryName);
+
+                if (!$gallery) {
+                    $gallery = $model->galleries($galleryName)->create(['name' => $galleryName]);
+                    $model->resolvedGalleries[$galleryName] = $gallery;
+                }
 
                 // Continue numbering after the current highest order without loading every image.
                 $maxOrder = $gallery->images()->max('order');
@@ -84,6 +90,12 @@ trait GalleriableTrait
                         $image->order = $k + $count;
                         $image->gallery()->associate($gallery);
                         $image->save();
+
+                        // Keep an already-resolved flatGallery() cache in sync so a later
+                        // call in the same request sees the image we just created.
+                        if (array_key_exists($galleryName, $model->resolvedFlatGalleries)) {
+                            $model->resolvedFlatGalleries[$galleryName][] = $image;
+                        }
 
                         $count++;
                     } catch (Throwable $e) {
