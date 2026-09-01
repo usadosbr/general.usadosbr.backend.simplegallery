@@ -13,6 +13,14 @@ use Mixdinternet\Trucks\Truck;
 
 trait GalleriableTrait
 {
+    /**
+     * How many GCS requests (download/upload/delete) run concurrently per
+     * batch inside processImages(). Mirrors
+     * WebserviceDownloadImagesCars::DOWNLOAD_CONCURRENCY in the main app,
+     * which bounds memory/connections the same way.
+     */
+    private static $gcsConcurrency = 10;
+
     public static function bootGalleriableTrait()
     {
         self::saved(function ($model) {
@@ -28,10 +36,11 @@ trait GalleriableTrait
             $modelClass = get_class($model);
             $queue = self::isIntegradorVehicle($model) ? 'imgs_integrador' : 'vehicles';
 
-            // Collect every processed image across all galleries so a single job
-            // handles the whole batch instead of one job (and one vehicle-exists
-            // query) per photo.
-            $pendingImages = [];
+            // First pass: resolve/create every gallery and assign each image its
+            // target path + order, without touching the network yet. Order is
+            // decided here, from the original request position, so the parallel
+            // GCS batches below can finish in any order without corrupting it.
+            $planned = [];
 
             foreach ($reqGallery as $galleryName) {
                 if (!isset($reqImages[$galleryName])) {
@@ -52,58 +61,65 @@ trait GalleriableTrait
                 $count = is_null($maxOrder) ? 0 : ((int) $maxOrder + 1);
 
                 foreach ($reqImages[$galleryName] as $k => $v) {
-                    try {
-                        $order = self::parseExplicitOrder($v);
-                        $suffix = is_null($order) ? '' : '--' . $order;
-                        $imagepath = $imageName . '-' . Str::random(2) . $suffix . '.webp';
+                    $order = self::parseExplicitOrder($v);
+                    $suffix = is_null($order) ? '' : '--' . $order;
+                    $imagepath = $imageName . '-' . Str::random(2) . $suffix . '.webp';
 
-                        $subDir = implode('/', str_split(substr(md5($imagepath), 0, 6), 2));
-                        $targetPath = '/media/gallery/' . $subDir . '/' . $imagepath;
+                    $subDir = implode('/', str_split(substr(md5($imagepath), 0, 6), 2));
+                    $targetPath = '/media/gallery/' . $subDir . '/' . $imagepath;
 
-                        $webp = self::toWebp(Storage::disk('gcs')->get($v));
+                    $planned[] = [
+                        'source' => $v,
+                        'targetPath' => $targetPath,
+                        'imagePath' => $imagepath,
+                        'subDir' => $subDir,
+                        'order' => $k + $count,
+                        'gallery' => $gallery,
+                        'galleryName' => $galleryName,
+                    ];
 
-                        if (!Storage::disk('gcs')->put($targetPath, $webp)) {
-                            continue;
-                        }
+                    $count++;
+                }
+            }
 
-                        // Only remove the source once the converted image is safely stored.
-                        Storage::disk('gcs')->delete($v);
+            // Download, convert and upload every image in bounded concurrent
+            // batches instead of one full get->convert->put->delete round trip
+            // at a time. Collect every processed image across all galleries so
+            // a single job handles the whole batch instead of one job (and one
+            // vehicle-exists query) per photo.
+            $pendingImages = [];
 
-                        $pendingImages[] = [
-                            'targetPath' => $targetPath,
-                            'imagePath' => $imagepath,
-                            'subDir' => $subDir,
-                        ];
+            foreach (self::processImages($planned, $model) as $item) {
+                try {
+                    $pendingImages[] = [
+                        'targetPath' => $item['targetPath'],
+                        'imagePath' => $item['imagePath'],
+                        'subDir' => $item['subDir'],
+                    ];
 
-                        // Skip persisting a duplicate record for the same gallery.
-                        // $alreadySaved = Image::where('name', $targetPath)
-                        //     ->where('gallery_id', $gallery->id)
-                        //     ->exists();
+                    // Skip persisting a duplicate record for the same gallery.
+                    // $alreadySaved = Image::where('name', $item['targetPath'])
+                    //     ->where('gallery_id', $item['gallery']->id)
+                    //     ->exists();
 
-                        // if ($alreadySaved) {
-                        //     continue;
-                        // }
+                    // if ($alreadySaved) {
+                    //     continue;
+                    // }
 
-                        $image = new Image();
-                        $image->name = $targetPath;
-                        $image->description = '';
-                        $image->order = $k + $count;
-                        $image->gallery()->associate($gallery);
-                        $image->save();
+                    $image = new Image();
+                    $image->name = $item['targetPath'];
+                    $image->description = '';
+                    $image->order = $item['order'];
+                    $image->gallery()->associate($item['gallery']);
+                    $image->save();
 
-                        // Keep an already-resolved flatGallery() cache in sync so a later
-                        // call in the same request sees the image we just created.
-                        if (array_key_exists($galleryName, $model->resolvedFlatGalleries)) {
-                            $model->resolvedFlatGalleries[$galleryName][] = $image;
-                        }
-
-                        $count++;
-                    } catch (Throwable $e) {
-                        devlogs("Diretório da imagem falhada: {$v}");
-                        devlogs($e->getMessage(), '');
-                        devlogs('Falha na inserção de imagem do anunciante: ' . $model->advertiser->id, '');
-                        devlogs('Falha na inserção de imagem do veículo: ' . $model->id, '');
+                    // Keep an already-resolved flatGallery() cache in sync so a later
+                    // call in the same request sees the image we just created.
+                    if (array_key_exists($item['galleryName'], $model->resolvedFlatGalleries)) {
+                        $model->resolvedFlatGalleries[$item['galleryName']][] = $image;
                     }
+                } catch (Throwable $e) {
+                    self::logImageFailure($model, $item['source'], $e);
                 }
             }
 
@@ -116,6 +132,125 @@ trait GalleriableTrait
 
             request()->replace(array_merge(request()->all(), ['gallery' => [''], 'images' => []]));
         });
+    }
+
+    /**
+     * Download every planned image's source blob from GCS, convert it to
+     * WebP, upload it and delete the source — in bounded concurrent batches
+     * per phase instead of one full round trip per image. Mirrors the
+     * chunked promise pattern already used by
+     * InsertImagesVehicle::uploadAll() and
+     * WebserviceDownloadImagesCars::photos() in the main app.
+     *
+     * @param array $planned Items with 'source', 'targetPath', 'imagePath',
+     *                       'subDir', 'order', 'gallery', 'galleryName' from
+     *                       the planning pass in bootGalleriableTrait().
+     * @return array The items whose WebP was uploaded successfully.
+     */
+    private static function processImages(array $planned, $model): array
+    {
+        if (!$planned) {
+            return [];
+        }
+
+        $adapter = Storage::disk('gcs')->getDriver()->getAdapter();
+        $bucket = $adapter->getBucket();
+        $prefix = $adapter->getPathPrefix();
+        $requestWrapper = self::gcsRequestWrapper($adapter->getStorageClient());
+        $bucketName = rawurlencode($bucket->name());
+
+        $processed = [];
+
+        foreach (array_chunk($planned, self::$gcsConcurrency) as $chunk) {
+            // 1. Fetch every source in this batch concurrently.
+            $downloadPromises = [];
+            foreach ($chunk as $i => $item) {
+                $downloadPromises[$i] = $bucket->object($adapter->applyPathPrefix($item['source']))->downloadAsStreamAsync();
+            }
+            $downloaded = \GuzzleHttp\Promise\Utils::settle($downloadPromises)->wait();
+
+            // 2. Convert whatever downloaded successfully. CPU-bound, so this
+            // stays sequential — the network calls are what dominate runtime.
+            $webps = [];
+            foreach ($chunk as $i => $item) {
+                if (($downloaded[$i]['state'] ?? null) !== 'fulfilled') {
+                    self::logImageFailure($model, $item['source'], $downloaded[$i]['reason'] ?? null);
+                    continue;
+                }
+
+                try {
+                    $webps[$i] = self::toWebp($downloaded[$i]['value']->getContents());
+                } catch (Throwable $e) {
+                    self::logImageFailure($model, $item['source'], $e);
+                }
+            }
+
+            if (!$webps) {
+                continue;
+            }
+
+            // 3. Upload every converted WebP in this batch concurrently.
+            $uploadPromises = [];
+            foreach ($webps as $i => $webp) {
+                $uploadPromises[$i] = $bucket->uploadAsync($webp, [
+                    'name' => $prefix . ltrim($chunk[$i]['targetPath'], '/'),
+                    'predefinedAcl' => 'publicRead',
+                ]);
+            }
+            $uploadResults = \GuzzleHttp\Promise\Utils::settle($uploadPromises)->wait();
+
+            // 4. Only originals whose WebP is safely stored are queued for
+            // deletion, and only successful uploads are returned for saving.
+            $deletePromises = [];
+            foreach (array_keys($webps) as $i) {
+                if (($uploadResults[$i]['state'] ?? null) !== 'fulfilled') {
+                    self::logImageFailure($model, $chunk[$i]['source'], $uploadResults[$i]['reason'] ?? null);
+                    continue;
+                }
+
+                $processed[] = $chunk[$i];
+
+                $objectName = rawurlencode($adapter->applyPathPrefix($chunk[$i]['source']));
+                $deletePromises[$i] = $requestWrapper->sendAsync(
+                    new \GuzzleHttp\Psr7\Request('DELETE', "https://storage.googleapis.com/storage/v1/b/{$bucketName}/o/{$objectName}")
+                );
+            }
+
+            if ($deletePromises) {
+                \GuzzleHttp\Promise\Utils::settle($deletePromises)->wait();
+            }
+        }
+
+        return $processed;
+    }
+
+    /**
+     * The GCS PHP client has no public async-delete API. Its request layer
+     * (auth + retries) is reachable only through StorageClient's private
+     * $connection, so it's pulled out once via reflection and reused as
+     * requestWrapper()->sendAsync() to drive concurrent deletes. Mirrors
+     * WebserviceDownloadImagesCars::gcsRequestWrapper() in the main app.
+     */
+    private static function gcsRequestWrapper($storageClient)
+    {
+        $property = new \ReflectionProperty($storageClient, 'connection');
+        $property->setAccessible(true);
+
+        return $property->getValue($storageClient)->requestWrapper();
+    }
+
+    /**
+     * Same log shape as the previous single-catch-block loop, so existing
+     * log-based monitoring/alerts for this event keep working unchanged.
+     */
+    private static function logImageFailure($model, string $source, $reason = null): void
+    {
+        devlogs("Diretório da imagem falhada: {$source}");
+        if ($reason instanceof Throwable) {
+            devlogs($reason->getMessage(), '');
+        }
+        devlogs('Falha na inserção de imagem do anunciante: ' . $model->advertiser->id, '');
+        devlogs('Falha na inserção de imagem do veículo: ' . $model->id, '');
     }
 
     /**
