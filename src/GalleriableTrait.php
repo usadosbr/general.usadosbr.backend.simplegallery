@@ -2,25 +2,16 @@
 
 namespace Mixdinternet\Galleries;
 
-use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
-use App\Jobs\InsertImagesVehicle;
-use Throwable;
 use Mixdinternet\Cars\Car;
+use Mixdinternet\Galleries\Jobs\ProcessGalleryImages;
 use Mixdinternet\Motorcycles\Motorcycle;
 use Mixdinternet\Sailings\Sailing;
 use Mixdinternet\Trucks\Truck;
 
 trait GalleriableTrait
 {
-    /**
-     * How many GCS requests (download/upload/delete) run concurrently per
-     * batch inside processImages(). Mirrors
-     * WebserviceDownloadImagesCars::DOWNLOAD_CONCURRENCY in the main app,
-     * which bounds memory/connections the same way.
-     */
-    private static $gcsConcurrency = 10;
-
     public static function bootGalleriableTrait()
     {
         self::saved(function ($model) {
@@ -28,6 +19,8 @@ trait GalleriableTrait
             if (!request()->has('gallery') || !request()->has('images')) {
                 return;
             }
+
+            $savedStart = microtime(true);
 
             $reqGallery = request()->get('gallery');
             $reqImages = request()->get('images');
@@ -39,7 +32,9 @@ trait GalleriableTrait
             // First pass: resolve/create every gallery and assign each image its
             // target path + order, without touching the network yet. Order is
             // decided here, from the original request position, so the parallel
-            // GCS batches below can finish in any order without corrupting it.
+            // GCS batches in ProcessGalleryImages can finish in any order without
+            // corrupting it. This whole pass is cheap (no downloads/Imagick), so
+            // it stays synchronous — only the network/CPU-heavy work is queued.
             $planned = [];
 
             foreach ($reqGallery as $galleryName) {
@@ -61,7 +56,20 @@ trait GalleriableTrait
                 $count = is_null($maxOrder) ? 0 : ((int) $maxOrder + 1);
 
                 foreach ($reqImages[$galleryName] as $k => $v) {
-                    $order = self::parseExplicitOrder($v);
+                    // A caller that already has the raw bytes in hand (e.g.
+                    // WebserviceDownloadImagesCars, which just downloaded and
+                    // uploaded them) can pass ['path' => ..., 'bytes' => ...]
+                    // instead of a plain path/URL, so ProcessGalleryImages skips
+                    // re-downloading what the caller already has.
+                    $isBytesEntry = is_array($v);
+                    $source = $isBytesEntry ? $v['path'] : $v;
+                    // base64: this whole item ends up as a property of a queued
+                    // job, which Redis serializes as JSON — a raw binary blob
+                    // isn't valid UTF-8 and json_encode() fails on it, silently
+                    // dropping the job (Illuminate\Queue\InvalidPayloadException).
+                    $sourceBytes = $isBytesEntry && isset($v['bytes']) ? base64_encode($v['bytes']) : null;
+
+                    $order = self::parseExplicitOrder($source);
                     $suffix = is_null($order) ? '' : '--' . $order;
                     $imagepath = $imageName . '-' . Str::random(2) . $suffix . '.webp';
 
@@ -69,188 +77,52 @@ trait GalleriableTrait
                     $targetPath = '/media/gallery/' . $subDir . '/' . $imagepath;
 
                     $planned[] = [
-                        'source' => $v,
+                        'source' => $source,
+                        'sourceBytes' => $sourceBytes,
                         'targetPath' => $targetPath,
                         'imagePath' => $imagepath,
                         'subDir' => $subDir,
-                        'order' => $k + $count,
-                        'gallery' => $gallery,
-                        'galleryName' => $galleryName,
+                        // $count alone: it already starts after the gallery's
+                        // existing images and increments once per new image
+                        // below. Adding $k too (pre-existing bug, predates this
+                        // refactor) double-counted, since $k already advances
+                        // in lockstep with $count — order came out as 0,2,4...
+                        // instead of 0,1,2...
+                        'order' => $count,
+                        'galleryId' => $gallery->id,
                     ];
 
                     $count++;
                 }
             }
 
-            // Download, convert and upload every image in bounded concurrent
-            // batches instead of one full get->convert->put->delete round trip
-            // at a time. Collect every processed image across all galleries so
-            // a single job handles the whole batch instead of one job (and one
-            // vehicle-exists query) per photo.
-            $pendingImages = [];
-
-            foreach (self::processImages($planned, $model) as $item) {
-                try {
-                    $pendingImages[] = [
-                        'targetPath' => $item['targetPath'],
-                        'imagePath' => $item['imagePath'],
-                        'subDir' => $item['subDir'],
-                    ];
-
-                    // Skip persisting a duplicate record for the same gallery.
-                    // $alreadySaved = Image::where('name', $item['targetPath'])
-                    //     ->where('gallery_id', $item['gallery']->id)
-                    //     ->exists();
-
-                    // if ($alreadySaved) {
-                    //     continue;
-                    // }
-
-                    $image = new Image();
-                    $image->name = $item['targetPath'];
-                    $image->description = '';
-                    $image->order = $item['order'];
-                    $image->gallery()->associate($item['gallery']);
-                    $image->save();
-
-                    // Keep an already-resolved flatGallery() cache in sync so a later
-                    // call in the same request sees the image we just created.
-                    if (array_key_exists($item['galleryName'], $model->resolvedFlatGalleries)) {
-                        $model->resolvedFlatGalleries[$item['galleryName']][] = $image;
-                    }
-                } catch (Throwable $e) {
-                    self::logImageFailure($model, $item['source'], $e);
+            // A caller that needs something to run only after Image rows exist
+            // (e.g. WebserviceDescriptionImages, which reads $vehicle->images)
+            // passes factories here instead of dispatching right after touch():
+            // $model->id is only known for sure once we're inside this saved()
+            // event, so each factory is called now, synchronously, with it.
+            $thenJobs = [];
+            foreach (request()->get('gallery_then', []) as $factory) {
+                if (is_callable($factory)) {
+                    $thenJobs[] = $factory($model->id);
                 }
             }
 
-            // One job per save, regardless of photo count: the job checks the
-            // vehicle exists once and processes every crop internally.
-            if (!empty($pendingImages)) {
-                dispatch(new InsertImagesVehicle($pendingImages, $model->id, $modelClass))
+            if ($planned) {
+                dispatch(new ProcessGalleryImages($planned, $modelClass, $model->id, $thenJobs))
                     ->onQueue($queue);
             }
 
-            request()->replace(array_merge(request()->all(), ['gallery' => [''], 'images' => []]));
+            request()->replace(array_merge(request()->all(), ['gallery' => [''], 'images' => [], 'gallery_then' => []]));
+
+            Log::info('GalleriableTrait: planejamento de galeria concluído', [
+                'model' => $modelClass,
+                'model_id' => $model->id,
+                'galerias' => $reqGallery,
+                'imagens_planejadas' => count($planned),
+                'duration_ms' => round((microtime(true) - $savedStart) * 1000, 1),
+            ]);
         });
-    }
-
-    /**
-     * Download every planned image's source blob from GCS, convert it to
-     * WebP, upload it and delete the source — in bounded concurrent batches
-     * per phase instead of one full round trip per image. Mirrors the
-     * chunked promise pattern already used by
-     * InsertImagesVehicle::uploadAll() and
-     * WebserviceDownloadImagesCars::photos() in the main app.
-     *
-     * @param array $planned Items with 'source', 'targetPath', 'imagePath',
-     *                       'subDir', 'order', 'gallery', 'galleryName' from
-     *                       the planning pass in bootGalleriableTrait().
-     * @return array The items whose WebP was uploaded successfully.
-     */
-    private static function processImages(array $planned, $model): array
-    {
-        if (!$planned) {
-            return [];
-        }
-
-        $adapter = Storage::disk('gcs')->getDriver()->getAdapter();
-        $bucket = $adapter->getBucket();
-        $prefix = $adapter->getPathPrefix();
-        $requestWrapper = self::gcsRequestWrapper($adapter->getStorageClient());
-        $bucketName = rawurlencode($bucket->name());
-
-        $processed = [];
-
-        foreach (array_chunk($planned, self::$gcsConcurrency) as $chunk) {
-            // 1. Fetch every source in this batch concurrently.
-            $downloadPromises = [];
-            foreach ($chunk as $i => $item) {
-                $downloadPromises[$i] = $bucket->object($adapter->applyPathPrefix($item['source']))->downloadAsStreamAsync();
-            }
-            $downloaded = \GuzzleHttp\Promise\Utils::settle($downloadPromises)->wait();
-
-            // 2. Convert whatever downloaded successfully. CPU-bound, so this
-            // stays sequential — the network calls are what dominate runtime.
-            $webps = [];
-            foreach ($chunk as $i => $item) {
-                if (($downloaded[$i]['state'] ?? null) !== 'fulfilled') {
-                    self::logImageFailure($model, $item['source'], $downloaded[$i]['reason'] ?? null);
-                    continue;
-                }
-
-                try {
-                    $webps[$i] = self::toWebp($downloaded[$i]['value']->getContents());
-                } catch (Throwable $e) {
-                    self::logImageFailure($model, $item['source'], $e);
-                }
-            }
-
-            if (!$webps) {
-                continue;
-            }
-
-            // 3. Upload every converted WebP in this batch concurrently.
-            $uploadPromises = [];
-            foreach ($webps as $i => $webp) {
-                $uploadPromises[$i] = $bucket->uploadAsync($webp, [
-                    'name' => $prefix . ltrim($chunk[$i]['targetPath'], '/'),
-                    'predefinedAcl' => 'publicRead',
-                ]);
-            }
-            $uploadResults = \GuzzleHttp\Promise\Utils::settle($uploadPromises)->wait();
-
-            // 4. Only originals whose WebP is safely stored are queued for
-            // deletion, and only successful uploads are returned for saving.
-            $deletePromises = [];
-            foreach (array_keys($webps) as $i) {
-                if (($uploadResults[$i]['state'] ?? null) !== 'fulfilled') {
-                    self::logImageFailure($model, $chunk[$i]['source'], $uploadResults[$i]['reason'] ?? null);
-                    continue;
-                }
-
-                $processed[] = $chunk[$i];
-
-                $objectName = rawurlencode($adapter->applyPathPrefix($chunk[$i]['source']));
-                $deletePromises[$i] = $requestWrapper->sendAsync(
-                    new \GuzzleHttp\Psr7\Request('DELETE', "https://storage.googleapis.com/storage/v1/b/{$bucketName}/o/{$objectName}")
-                );
-            }
-
-            if ($deletePromises) {
-                \GuzzleHttp\Promise\Utils::settle($deletePromises)->wait();
-            }
-        }
-
-        return $processed;
-    }
-
-    /**
-     * The GCS PHP client has no public async-delete API. Its request layer
-     * (auth + retries) is reachable only through StorageClient's private
-     * $connection, so it's pulled out once via reflection and reused as
-     * requestWrapper()->sendAsync() to drive concurrent deletes. Mirrors
-     * WebserviceDownloadImagesCars::gcsRequestWrapper() in the main app.
-     */
-    private static function gcsRequestWrapper($storageClient)
-    {
-        $property = new \ReflectionProperty($storageClient, 'connection');
-        $property->setAccessible(true);
-
-        return $property->getValue($storageClient)->requestWrapper();
-    }
-
-    /**
-     * Same log shape as the previous single-catch-block loop, so existing
-     * log-based monitoring/alerts for this event keep working unchanged.
-     */
-    private static function logImageFailure($model, string $source, $reason = null): void
-    {
-        devlogs("Diretório da imagem falhada: {$source}");
-        if ($reason instanceof Throwable) {
-            devlogs($reason->getMessage(), '');
-        }
-        devlogs('Falha na inserção de imagem do anunciante: ' . $model->advertiser->id, '');
-        devlogs('Falha na inserção de imagem do veículo: ' . $model->id, '');
     }
 
     /**
@@ -318,22 +190,6 @@ trait GalleriableTrait
     }
 
     /**
-     * Convert a raw image blob to a stripped WebP blob (in memory, no temp files).
-     */
-    private static function toWebp(string $blob): string
-    {
-        $imagick = new \Imagick();
-        $imagick->readImageBlob($blob);
-        $imagick->stripImage();
-        $imagick->setImageFormat('webp');
-        $webp = $imagick->getImageBlob();
-        $imagick->clear();
-        $imagick->destroy();
-
-        return $webp;
-    }
-
-    /**
      * Resolved galleries keyed by name, memoized per model instance so repeated
      * accessor/helper calls don't re-run the same "where name = ?" query.
      */
@@ -366,7 +222,7 @@ trait GalleriableTrait
 
     /**
      * Return a flat array of images for the given gallery name, or an empty array if the gallery doesn't exist. This is useful for APIs that need to return a simple list of images without nested relationships.
-     * 
+     *
      * @param string $name The name of the gallery to retrieve images from.
      * @return array An array of images with 'id', 'name', 'description', and 'order' fields, or an empty array if the gallery doesn't exist.
      */
