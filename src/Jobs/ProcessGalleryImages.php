@@ -48,12 +48,9 @@ class ProcessGalleryImages implements ShouldQueue
     protected $thenJobs;
 
     /**
-     * @param array $planned Items with 'source' (GCS path), 'sourceBytes'
-     *                       (base64-encoded blob when the caller already
-     *                       downloaded it, null otherwise — skips the GCS
-     *                       re-download), 'targetPath', 'imagePath', 'subDir',
-     *                       'order' and 'galleryId' from GalleriableTrait's
-     *                       planning pass.
+     * @param array $planned Items with 'source' (GCS path), 'targetPath',
+     *                       'imagePath', 'subDir', 'order' and 'galleryId'
+     *                       from GalleriableTrait's planning pass.
      * @param array $thenJobs Already-constructed ShouldQueue jobs to dispatch
      *                        once every image is processed — for callers that
      *                        need something to run only after Image rows exist
@@ -91,34 +88,31 @@ class ProcessGalleryImages implements ShouldQueue
         $batchCount = count($batches);
 
         foreach ($batches as $batchIndex => $chunk) {
-            // 1. Get every source's bytes: reuse them when the caller already
-            // downloaded them (WebserviceDownloadImagesCars does), otherwise
-            // fetch from GCS concurrently.
+            // 1. Fetch every source from GCS concurrently. Deliberately not
+            // passed in from the dispatching job (e.g. WebserviceDownloadImagesCars
+            // already has these bytes) — each image's bytes, base64-encoded to
+            // survive the Redis driver's JSON payload, added ~80KB per image
+            // (~1.6MB for a 20-photo batch) to this job's queued payload size.
+            // Under a dispatch burst that outpaces available workers, that is
+            // enough to blow well past Redis's memory budget across the many
+            // jobs then sitting in the queue at once — a GCS round-trip per
+            // image is worth paying to keep the queued payload just a few
+            // small strings.
             $downloadStart = microtime(true);
             $bytesByKey = [];
             $downloadPromises = [];
 
             foreach ($chunk as $i => $item) {
-                if ($item['sourceBytes'] !== null) {
-                    // GalleriableTrait base64-encodes this before it becomes a
-                    // property of this queued job (raw binary can't survive the
-                    // Redis driver's JSON-encoded payload).
-                    $bytesByKey[$i] = base64_decode($item['sourceBytes']);
-                    continue;
-                }
-
                 $downloadPromises[$i] = $bucket->object($adapter->applyPathPrefix($item['source']))->downloadAsStreamAsync();
             }
 
-            if ($downloadPromises) {
-                $downloaded = \GuzzleHttp\Promise\Utils::settle($downloadPromises)->wait();
+            $downloaded = \GuzzleHttp\Promise\Utils::settle($downloadPromises)->wait();
 
-                foreach ($downloadPromises as $i => $_) {
-                    if (($downloaded[$i]['state'] ?? null) === 'fulfilled') {
-                        $bytesByKey[$i] = $downloaded[$i]['value']->getContents();
-                    } else {
-                        self::logImageFailure($this->modelClass, $this->modelId, $chunk[$i]['source'], $downloaded[$i]['reason'] ?? null);
-                    }
+            foreach ($downloaded as $i => $result) {
+                if (($result['state'] ?? null) === 'fulfilled') {
+                    $bytesByKey[$i] = $result['value']->getContents();
+                } else {
+                    self::logImageFailure($this->modelClass, $this->modelId, $chunk[$i]['source'], $result['reason'] ?? null);
                 }
             }
 
