@@ -56,20 +56,7 @@ trait GalleriableTrait
                 $count = is_null($maxOrder) ? 0 : ((int) $maxOrder + 1);
 
                 foreach ($reqImages[$galleryName] as $k => $v) {
-                    // A caller that already has the raw bytes in hand (e.g.
-                    // WebserviceDownloadImagesCars, which just downloaded and
-                    // uploaded them) can pass ['path' => ..., 'bytes' => ...]
-                    // instead of a plain path/URL, so ProcessGalleryImages skips
-                    // re-downloading what the caller already has.
-                    $isBytesEntry = is_array($v);
-                    $source = $isBytesEntry ? $v['path'] : $v;
-                    // base64: this whole item ends up as a property of a queued
-                    // job, which Redis serializes as JSON — a raw binary blob
-                    // isn't valid UTF-8 and json_encode() fails on it, silently
-                    // dropping the job (Illuminate\Queue\InvalidPayloadException).
-                    $sourceBytes = $isBytesEntry && isset($v['bytes']) ? base64_encode($v['bytes']) : null;
-
-                    $order = self::parseExplicitOrder($source);
+                    $order = self::parseExplicitOrder($v);
                     $suffix = is_null($order) ? '' : '--' . $order;
                     $imagepath = $imageName . '-' . Str::random(2) . $suffix . '.webp';
 
@@ -77,8 +64,7 @@ trait GalleriableTrait
                     $targetPath = '/media/gallery/' . $subDir . '/' . $imagepath;
 
                     $planned[] = [
-                        'source' => $source,
-                        'sourceBytes' => $sourceBytes,
+                        'source' => $v,
                         'targetPath' => $targetPath,
                         'imagePath' => $imagepath,
                         'subDir' => $subDir,
