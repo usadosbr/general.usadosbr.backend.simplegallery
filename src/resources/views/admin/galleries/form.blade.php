@@ -1,3 +1,10 @@
+@if(($pendingCount ?? 0) > 0)
+    <div class="alert alert-info">
+        <i class="fa fa-spinner fa-spin"></i>
+        {{ $pendingCount }} {{ $pendingCount == 1 ? 'imagem está sendo processada' : 'imagens estão sendo processadas' }} e {{ $pendingCount == 1 ? 'aparecerá' : 'aparecerão' }} aqui em instantes.
+    </div>
+@endif
+
 <div class="dropzone" id="mx_dropzone_{{ $name }}" data-url="{{ route('admin.galleries.upload') }}">
     {!! BootForm::hidden('_token', csrf_token()) !!}
     {!! BootForm::hidden('gallery[]', $name)  !!}

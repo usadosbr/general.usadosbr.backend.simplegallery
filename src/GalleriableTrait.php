@@ -2,6 +2,7 @@
 
 namespace Mixdinternet\Galleries;
 
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Mixdinternet\Cars\Car;
@@ -95,6 +96,27 @@ trait GalleriableTrait
             }
 
             if ($planned) {
+                // Cache-only signal for the edit page to show a "processing"
+                // banner while ProcessGalleryImages runs — doesn't touch the
+                // job's own writes. Tracking the exact planned target paths
+                // (not just a count) keeps this correct even if the real image
+                // count moves for a reason unrelated to this dispatch — a
+                // manual delete, or the job processing some but not all of a
+                // batch (it logs per-image failures without aborting): a path
+                // only stops counting as pending once a galleries_images row
+                // with that exact name exists. The TTL is a safety net for a
+                // path that never lands (a failed image), so it still
+                // disappears eventually instead of staying stuck forever.
+                foreach (collect($planned)->groupBy('galleryId') as $galleryId => $items) {
+                    $cacheKey = 'gallery_pending:' . $galleryId;
+                    $paths = array_values(array_unique(array_merge(
+                        Cache::get($cacheKey, []),
+                        $items->pluck('targetPath')->all()
+                    )));
+
+                    Cache::put($cacheKey, $paths, now()->addMinutes(15));
+                }
+
                 dispatch(new ProcessGalleryImages($planned, $modelClass, $model->id, $thenJobs))
                     ->onQueue($queue);
             }
