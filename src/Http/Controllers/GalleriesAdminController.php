@@ -3,6 +3,7 @@
 namespace Mixdinternet\Galleries\Http\Controllers;
 
 use App\Http\Controllers\AdminController;
+use App\Jobs\DeleteGalleryImageFiles;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 use Mixdinternet\Galleries\Image;
@@ -85,6 +86,13 @@ class GalleriesAdminController extends AdminController
     public function destroy(Request $request)
     {
         $id = $request->get('id');
+        $images = Image::whereIn('id', (array) $id)->get(['id', 'name']);
+
         Image::destroy($id);
+
+        // The row is only soft-deleted; without this, nothing ever removes the
+        // original and its crops from the bucket. Queued so the admin request
+        // doesn't wait on the GCS round trips.
+        DeleteGalleryImageFiles::dispatchFor($images);
     }
 }
