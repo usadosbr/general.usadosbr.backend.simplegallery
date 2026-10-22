@@ -5,7 +5,8 @@ namespace Mixdinternet\Galleries\Events;
 /**
  * Fired once ProcessGalleryImages finishes creating Image rows for a model,
  * so host apps can refresh anything that assumed images existed synchronously
- * right after touch()/save() — safe to fire even when nothing listens.
+ * right after touch()/save() — safe to fire even when nothing listens. Also
+ * fired by Gallery::imagesChanged() after images are removed or reordered.
  */
 class GalleryImagesReady
 {
