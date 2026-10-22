@@ -25,6 +25,10 @@ trait GalleriableTrait
 
             $reqGallery = request()->get('gallery');
             $reqImages = request()->get('images');
+            // Optional final sequence per gallery, mixing existing and new
+            // images (see Gallery::planOrders()). Without it, new images are
+            // appended after the existing ones.
+            $reqLayout = request()->get('gallery_layout', []);
 
             $imageName = strtolower(self::buildGalleryImageName($model, $reqGallery));
             $modelClass = get_class($model);
@@ -39,7 +43,10 @@ trait GalleriableTrait
             $planned = [];
 
             foreach ($reqGallery as $galleryName) {
-                if (!isset($reqImages[$galleryName])) {
+                $newImages = $reqImages[$galleryName] ?? [];
+                $layout = $reqLayout[$galleryName] ?? null;
+
+                if (!$newImages && !is_array($layout)) {
                     continue;
                 }
 
@@ -47,16 +54,27 @@ trait GalleriableTrait
                 // same request doesn't re-query for the gallery we just fetched or created.
                 $gallery = $model->gallery($galleryName);
 
+                if (!$newImages) {
+                    // Only existing images to put in order: renumber them
+                    // now, nothing is queued to tell the host app about it.
+                    if ($gallery && $gallery->arrange(array_column($layout, 'existing'))) {
+                        $gallery->imagesChanged();
+                    }
+
+                    continue;
+                }
+
                 if (!$gallery) {
                     $gallery = $model->galleries($galleryName)->create(['name' => $galleryName]);
                     $model->resolvedGalleries[$galleryName] = $gallery;
                 }
 
-                // Continue numbering after the current highest order without loading every image.
-                $maxOrder = $gallery->images()->max('order');
-                $count = is_null($maxOrder) ? 0 : ((int) $maxOrder + 1);
+                // Reserved under a lock and counting batches still in the
+                // queue, so a second save before ProcessGalleryImages inserts
+                // this batch can't reuse the same orders.
+                $orders = $gallery->planOrders(array_keys($newImages), is_array($layout) ? $layout : null);
 
-                foreach ($reqImages[$galleryName] as $k => $v) {
+                foreach ($newImages as $k => $v) {
                     $order = self::parseExplicitOrder($v);
                     $suffix = is_null($order) ? '' : '--' . $order;
                     $imagepath = $imageName . '-' . Str::random(2) . $suffix . '.webp';
@@ -69,17 +87,9 @@ trait GalleriableTrait
                         'targetPath' => $targetPath,
                         'imagePath' => $imagepath,
                         'subDir' => $subDir,
-                        // $count alone: it already starts after the gallery's
-                        // existing images and increments once per new image
-                        // below. Adding $k too (pre-existing bug, predates this
-                        // refactor) double-counted, since $k already advances
-                        // in lockstep with $count — order came out as 0,2,4...
-                        // instead of 0,1,2...
-                        'order' => $count,
+                        'order' => $orders[$k],
                         'galleryId' => $gallery->id,
                     ];
-
-                    $count++;
                 }
             }
 
@@ -121,7 +131,7 @@ trait GalleriableTrait
                     ->onQueue($queue);
             }
 
-            request()->replace(array_merge(request()->all(), ['gallery' => [''], 'images' => [], 'gallery_then' => []]));
+            request()->replace(array_merge(request()->all(), ['gallery' => [''], 'images' => [], 'gallery_layout' => [], 'gallery_then' => []]));
 
             Log::info('GalleriableTrait: planejamento de galeria concluído', [
                 'model' => $modelClass,
