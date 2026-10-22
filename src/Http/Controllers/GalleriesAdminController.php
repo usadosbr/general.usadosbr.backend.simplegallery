@@ -6,6 +6,7 @@ use App\Http\Controllers\AdminController;
 use App\Jobs\DeleteGalleryImageFiles;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
+use Mixdinternet\Galleries\Gallery;
 use Mixdinternet\Galleries\Image;
 
 class GalleriesAdminController extends AdminController
@@ -60,10 +61,15 @@ class GalleriesAdminController extends AdminController
      */
     public function sort(Request $request)
     {
-        $images = $request->get('image');
-        foreach ($images as $k => $v) {
-            Image::find($v)->update(['order' => $k]);
-        }
+        $ids = (array) $request->get('image', []);
+
+        // Renumbers the whole gallery, not only the images on the page: one
+        // processed after the page loaded would otherwise keep an order that
+        // can collide with the new ones.
+        Gallery::whereIn('id', Image::whereIn('id', $ids)->pluck('gallery_id')->unique())->get()->each(function ($gallery) use ($ids) {
+            $gallery->arrange($ids);
+            $gallery->imagesChanged();
+        });
     }
 
     /**
@@ -86,9 +92,11 @@ class GalleriesAdminController extends AdminController
     public function destroy(Request $request)
     {
         $id = $request->get('id');
-        $images = Image::whereIn('id', (array) $id)->get(['id', 'name']);
+        $images = Image::whereIn('id', (array) $id)->get(['id', 'name', 'gallery_id']);
 
         Image::destroy($id);
+
+        Gallery::whereIn('id', $images->pluck('gallery_id'))->get()->each->imagesChanged();
 
         // The row is only soft-deleted; without this, nothing ever removes the
         // original and its crops from the bucket. Queued so the admin request
